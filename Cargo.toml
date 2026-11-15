@@ -23,6 +23,7 @@ bs58 = "0.5.1"
 bytes = "1.10.1"
 bytestring = "1.5.0"
 circular-buffer = "1.2.0"
+chacha20poly1305 = "0.10.1"
 clap = "4.5.49"
 config = { version = "0.15.18", features = ["toml"] }
 enum_dispatch = "0.3.13"
@@ -31,6 +32,7 @@ fjall = { version = "3.0.0-rc.6", features = ["bytes_1", "lz4"] }
 foldhash = "0.2.0"
 futures = "0.3.31"
 hashbrown = "0.16.0"
+hkdf = "0.12.4"
 indoc = "2.0.7"
 itertools = "0.14.0"
 parking_lot = "0.12.5"
@@ -41,6 +43,7 @@ range-set-blaze = "0.4.1"
 reqwest = { version = "0.12.26", default-features = false, features = ["hickory-dns"] }
 rusqlite = "0.38.0"
 serde = "1.0.228"
+sha2 = "0.10.9"
 splinter-rs = "0.12.1"
 sqlite-plugin = { version = "0.9.0", default-features = false }
 static_assertions = "1.1.0"
