@@ -1,0 +1,28 @@
+[package]
+name = "cdc-cli"
+version = "0.1.0"
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+description = "Command line interface for the encrypted, deduplicating CDC volume."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cdc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+cdc-volume = { path = "../cdc-volume" }
+clap = { workspace = true, features = ["derive"] }
+graft = { path = "../graft" }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
