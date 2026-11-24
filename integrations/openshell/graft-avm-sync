@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# graft-avm-sync — publish the host avm-pkg store through Graft and deploy an
+# immutable, read-only package tree for OpenShell guests.
+#
+# Output: the absolute path of the deployed tree on stdout. Progress and the
+# publish manifest go to stderr, so callers can do:
+#
+#   DEPLOYMENT="$(graft-avm-sync)"
+#
+# The deployed layout is:
+#
+#   <deployment>/store/       the host avm-pkg store (packs, index, manifests)
+#   <deployment>/bin/avm-pkg  the host binary, for guests that share /nix
+#
+# If the avm-uploadd staging cache exists, pending guest uploads are imported
+# through avm-pkg before the copy. Graft stores the tree as FastCDC chunks, so a
+# new sync only uploads chunks that changed since earlier releases. Every
+# OpenShell guest mounts the same deployment read-only; the store is not copied
+# into any guest.
+set -euo pipefail
+
+log() { printf 'graft-avm-sync: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+
+STATE_ROOT="${GRAFT_AVM_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/graft/avm}"
+AVM_STORE="${GRAFT_AVM_STORE:-${AVM_PKG_STORE:-$PWD/avm-store}}"
+REPO_SPEC="${GRAFT_AVM_REPO:-fs:$STATE_ROOT/repo}"
+DEPLOY_ROOT="${GRAFT_AVM_DEPLOY_ROOT:-$STATE_ROOT/runtime}"
+PREFIX="${GRAFT_AVM_PREFIX:-updates}"
+NAME="${GRAFT_AVM_NAME:-avm}"
+KEEP="${GRAFT_AVM_KEEP:-3}"
+IMPORT_ROOT="${GRAFT_AVM_IMPORT_ROOT:-${GRAFT_AVM_UPLOAD_ROOT:-$STATE_ROOT/upload-cache}}"
+IMPORT=1
+PRUNE_REFS="${GRAFT_AVM_PRUNE_REFS:-1}"
+GC_GRACE="${GRAFT_AVM_GC_GRACE_SECS:-86400}"
+SIGNING_KEY="${GRAFT_AVM_SIGNING_KEY:-}"
+PUBLIC_KEY="${GRAFT_AVM_PUBLIC_KEY:-}"
+WORKSPACE_BIN="${GRAFT_WORKSPACE_BIN:-workspace}"
+AVM_PKG_BIN="${AVM_PKG_BIN:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --store) AVM_STORE="$2"; shift 2 ;;
+    --repo) REPO_SPEC="$2"; shift 2 ;;
+    --deploy-root) DEPLOY_ROOT="$2"; shift 2 ;;
+    --name) NAME="$2"; shift 2 ;;
+    --keep) KEEP="$2"; shift 2 ;;
+    --import-root) IMPORT_ROOT="$2"; shift 2 ;;
+    --no-import) IMPORT=0; shift ;;
+    --no-prune-refs) PRUNE_REFS=0; shift ;;
+    --gc-grace) GC_GRACE="$2"; shift 2 ;;
+    --signing-key) SIGNING_KEY="$2"; shift 2 ;;
+    --public-key) PUBLIC_KEY="$2"; shift 2 ;;
+    --help|-h)
+      cat <<'USAGE'
+usage: graft-avm-sync [options]
+
+  --store DIR          avm-pkg store to publish (default: $AVM_PKG_STORE or ./avm-store)
+  --repo SPEC          Graft update repository (default: fs:$XDG_STATE_HOME/graft/avm/repo)
+  --deploy-root DIR    deployment root (default: $XDG_STATE_HOME/graft/avm/runtime)
+  --name NAME          repository/package name (default: avm)
+  --keep N             deployments and repository refs to retain (default: 3)
+  --import-root DIR    avm-uploadd staging root (default: $XDG_STATE_HOME/graft/avm/upload-cache)
+  --no-import          do not ingest guest uploads before publishing
+  --no-prune-refs      keep all update repository refs/chunks
+  --gc-grace SECS      keep unreferenced objects newer than this (default: 86400)
+  --signing-key FILE   sign the Graft release manifest
+  --public-key FILE    require that key when deploying
+USAGE
+      exit 0
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -d "$AVM_STORE" ]] || die "avm-pkg store does not exist: $AVM_STORE"
+[[ -f "$AVM_STORE/index/chunks.idx" ]] || die "$AVM_STORE is not an initialized avm-pkg store"
+[[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || die "--keep must be a positive integer"
+[[ "$GC_GRACE" =~ ^[0-9]+$ ]] || die "--gc-grace must be a non-negative integer"
+
+if [[ -z "$AVM_PKG_BIN" ]]; then
+  AVM_PKG_BIN="$(command -v avm-pkg || true)"
+  if [[ -z "$AVM_PKG_BIN" && -x "$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg" ]]; then
+    AVM_PKG_BIN="$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg"
+  fi
+fi
+[[ -n "$AVM_PKG_BIN" && -x "$AVM_PKG_BIN" ]] || die "avm-pkg not found; set AVM_PKG_BIN"
+command -v "$WORKSPACE_BIN" >/dev/null 2>&1 || die "workspace not found; set GRAFT_WORKSPACE_BIN"
+
+AVM_STORE="$(readlink -f "$AVM_STORE")"
+AVM_PKG_BIN="$(readlink -f "$AVM_PKG_BIN")"
+mkdir -p "$STATE_ROOT" "$DEPLOY_ROOT"
+
+if [[ "$IMPORT" == 1 && -d "$IMPORT_ROOT" ]]; then
+  IMPORT_ARGS=(--store "$AVM_STORE" --upload-root "$IMPORT_ROOT")
+  if [[ -n "${GRAFT_AVM_UPLOAD_URL:-}" ]]; then
+    IMPORT_ARGS+=(--remote "$GRAFT_AVM_UPLOAD_URL")
+  fi
+  GRAFT_AVM_STATE="$STATE_ROOT" AVM_PKG_BIN="$AVM_PKG_BIN" \
+    "$SCRIPT_DIR/graft-avm-import" "${IMPORT_ARGS[@]}"
+fi
+
+# Serialize syncs that share a deployment root. This does not lock avm-pkg
+# itself; the signature check below catches a concurrently modified store.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$STATE_ROOT/.sync.lock"
+  flock -w 300 9 || die "another graft-avm-sync is still running"
+fi
+
+STAGE="$(mktemp -d "$STATE_ROOT/.stage.XXXXXX")"
+cleanup() { rm -rf "$STAGE"; }
+trap cleanup EXIT
+mkdir -p "$STAGE/bin"
+
+store_signature() {
+  find "$AVM_STORE" -type f -printf '%P\t%s\t%T@\n' | LC_ALL=C sort
+}
+
+# avm-pkg appends to packfiles in place, so hardlinks are NOT safe here: a
+# later put would mutate the staged snapshot through the shared inode. Take a
+# real copy (reflink where supported) and retry if any source file changed
+# while it was being copied, so a half-written pack/index generation is never
+# published as a release.
+copy_store() {
+  local before after
+  before="$(store_signature)"
+  rm -rf "$STAGE/store"
+  mkdir -p "$STAGE/store"
+  cp --reflink=auto -a "$AVM_STORE/." "$STAGE/store/"
+  after="$(store_signature)"
+  [[ "$before" == "$after" ]]
+}
+
+copied=0
+for attempt in 1 2 3; do
+  if copy_store; then
+    copied=1
+    break
+  fi
+  log "store changed while copying (attempt $attempt); retrying"
+  sleep 1
+done
+[[ "$copied" == 1 ]] || die "avm-pkg store kept changing; quiesce writers and retry"
+
+cp "$AVM_PKG_BIN" "$STAGE/bin/avm-pkg"
+cp "$SCRIPT_DIR/avm-pkg-upload" "$STAGE/bin/avm-pkg-upload"
+chmod 0755 "$STAGE/bin/avm-pkg" "$STAGE/bin/avm-pkg-upload"
+
+RELEASE="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+COMMON=(update --repo "$REPO_SPEC" --prefix "$PREFIX")
+PUBLISH=("${COMMON[@]}" publish "$NAME" "$RELEASE" "$STAGE")
+DEPLOY=("${COMMON[@]}" deploy "$NAME" "$RELEASE" "$DEPLOY_ROOT")
+if [[ -n "$SIGNING_KEY" ]]; then
+  PUBLISH+=(--signing-key "$SIGNING_KEY")
+fi
+if [[ -n "$PUBLIC_KEY" ]]; then
+  DEPLOY+=(--public-key "$PUBLIC_KEY")
+fi
+
+log "publishing $NAME/$RELEASE from $AVM_STORE"
+PUBLISHED="$("$WORKSPACE_BIN" "${PUBLISH[@]}")"
+printf '%s\n' "$PUBLISHED" >&2
+MANIFEST="$(printf '%s\n' "$PUBLISHED" | awk '/^published / { print $NF; exit }')"
+[[ -n "$MANIFEST" ]] || die "publish did not report a manifest hash"
+
+log "deploying $NAME/$RELEASE to $DEPLOY_ROOT"
+DEPLOYED="$("$WORKSPACE_BIN" "${DEPLOY[@]}")"
+printf '%s\n' "$DEPLOYED" >&2
+
+CURRENT="$(readlink -f "$DEPLOY_ROOT/current")"
+[[ -d "$CURRENT/store" ]] || die "deployment has no store/: $CURRENT"
+[[ -x "$CURRENT/bin/avm-pkg" ]] || die "deployment has no executable bin/avm-pkg: $CURRENT"
+[[ -x "$CURRENT/bin/avm-pkg-upload" ]] || die "deployment has no executable bin/avm-pkg-upload: $CURRENT"
+
+# Keep the active and previous trees by default, plus recent history.
+if "$WORKSPACE_BIN" "${COMMON[@]}" prune-deployments "$DEPLOY_ROOT" --keep "$KEEP" >/dev/null 2>&1; then
+  :
+else
+  log "warning: deployment prune failed; retaining all deployments"
+fi
+
+if [[ "$PRUNE_REFS" == 1 ]]; then
+  if "$WORKSPACE_BIN" "${COMMON[@]}" prune-refs "$NAME" --keep "$KEEP" --grace-secs "$GC_GRACE" >/dev/null 2>&1; then
+    "$WORKSPACE_BIN" "${COMMON[@]}" gc "$NAME" --grace-secs "$GC_GRACE" >/dev/null 2>&1 ||
+      log "warning: repository GC failed; old chunks retained"
+  else
+    log "warning: repository ref prune failed; old refs retained"
+  fi
+fi
+
+log "manifest $MANIFEST"
+printf '%s\n' "$CURRENT"

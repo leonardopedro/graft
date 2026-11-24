@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# avm-pkg-upload — push a package from inside an OpenShell guest to the
+# authenticated host upload cache.
+#
+# The host launcher exports AVM_UPLOAD_URL (a token-bearing URL). The package
+# may live in the read-only shared store or in a writable store:
+#
+#   avm-pkg --store /workspace/.avm-store put ./thing --name thing --version 1
+#   AVM_PKG_STORE=/workspace/.avm-store avm-pkg-upload <manifest-hex>
+set -euo pipefail
+
+die() { printf 'avm-pkg-upload: %s\n' "$*" >&2; exit 1; }
+
+[[ -n "${AVM_UPLOAD_URL:-}" ]] || die "AVM_UPLOAD_URL is not set; start openshell-avm with upload enabled"
+[[ $# -ge 1 ]] || die "usage: avm-pkg-upload <manifest-hex>"
+
+STORE="${AVM_PKG_STORE:-/opt/graft-packages/store}"
+[[ -x /opt/graft-packages/bin/avm-pkg ]] || die "avm-pkg is not mounted at /opt/graft-packages/bin"
+exec /opt/graft-packages/bin/avm-pkg --store "$STORE" push "$@" --remote "$AVM_UPLOAD_URL"

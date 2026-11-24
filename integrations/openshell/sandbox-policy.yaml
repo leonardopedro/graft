@@ -1,0 +1,37 @@
+# OpenShell policy for a microVM using the shared Graft avm-pkg store.
+# The bind mounts attach over virtiofs; Landlock also needs the mount targets
+# in the policy or every open() returns EACCES.
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /lib64
+    - /etc
+    - /proc
+    - /var/log
+    - /dev/urandom
+    - /nix
+    - /opt/graft-packages
+  read_write:
+    - /tmp
+    - /dev/null
+    - /workspace
+
+landlock:
+  compatibility: hard_requirement
+
+# The package store is read from the host mount. This one TCP rule is only
+# for the authenticated avm-pkg upload cache on the gateway host.
+network_policies:
+  avm_upload:
+    endpoints:
+      - host: host.openshell.internal
+        port: 18090
+        protocol: tcp
+    binaries:
+      - path: /opt/graft-packages/bin/avm-pkg
+      - path: /opt/graft-packages/bin/avm-pkg-upload

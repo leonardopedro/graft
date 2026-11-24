@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# ci-smoke — run the OpenShell integration checks that do not need a live
+# gateway. If avm-pkg is available, also run the host-side avm-pkg acceptance
+# paths. CI provides AVM_PKG_BIN; local runs fall back to ../australVM.
+set -euo pipefail
+
+die() { printf 'ci-smoke: %s\n' "$*" >&2; exit 1; }
+log() { printf 'ci-smoke: %s\n' "$*" >&2; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+AVM_PKG_BIN="${AVM_PKG_BIN:-}"
+
+SCRIPTS=(graft-avm-sync graft-avm-import graft-avm-init openshell-avm verify-avm-store verify-avm-upload avm-pkg-upload install-systemd-user)
+for script in "${SCRIPTS[@]}"; do
+  bash -n "$SCRIPT_DIR/$script"
+done
+
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck "${SCRIPTS[@]/#/$SCRIPT_DIR/}"
+fi
+
+cargo build -p avm-uploadd --manifest-path "$REPO_ROOT/Cargo.toml"
+cargo test -p avm-uploadd --manifest-path "$REPO_ROOT/Cargo.toml"
+
+if [[ -z "$AVM_PKG_BIN" ]]; then
+  AVM_PKG_BIN="$(command -v avm-pkg || true)"
+fi
+if [[ -z "$AVM_PKG_BIN" && -x "$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg" ]]; then
+  AVM_PKG_BIN="$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg"
+fi
+if [[ -z "$AVM_PKG_BIN" ]]; then
+  log "avm-pkg unavailable; skipped host avm-pkg acceptance checks"
+  exit 0
+fi
+AVM_PKG_BIN="$(readlink -f "$AVM_PKG_BIN")"
+export AVM_PKG_BIN
+
+cargo build -p graft-workspace --bin workspace --manifest-path "$REPO_ROOT/Cargo.toml"
+"$SCRIPT_DIR/verify-avm-store"
+"$SCRIPT_DIR/verify-avm-upload"
+
+XDG_CONFIG_HOME="$REPO_ROOT/target/ci-systemd-config" \
+GRAFT_AVM_STATE="$REPO_ROOT/target/openshell-avm-verify/state" \
+GRAFT_AVM_STORE="$REPO_ROOT/target/openshell-avm-verify/host-store" \
+  "$SCRIPT_DIR/install-systemd-user" --dry-run
+log "all integration checks passed"

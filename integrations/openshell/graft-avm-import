@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# graft-avm-import — pull manifests staged by avm-uploadd into the host
+# avm-pkg store.
+#
+# Before pulling, each manifest must carry a valid Ed25519 signature from a
+# key in the allowlist. avm-pkg pull then re-verifies the manifest identity and
+# every chunk digest, so the upload cache is untrusted staging space: a bad or
+# unsigned upload fails the import instead of poisoning the shared store.
+set -euo pipefail
+
+log() { printf 'graft-avm-import: %s\n' "$*" >&2; }
+die() { log "$*"; exit 1; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+STATE_ROOT="${GRAFT_AVM_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/graft/avm}"
+UPLOAD_ROOT="${GRAFT_AVM_UPLOAD_ROOT:-$STATE_ROOT/upload-cache}"
+TOKEN_FILE="${GRAFT_AVM_UPLOAD_TOKEN_FILE:-$STATE_ROOT/upload.token}"
+SIGNERS_FILE="${GRAFT_AVM_UPLOAD_SIGNERS_FILE:-$STATE_ROOT/upload-allowed-signers}"
+SIGNERS_SPEC="${GRAFT_AVM_UPLOAD_SIGNERS:-}"
+PORT="${AVM_UPLOAD_PORT:-18090}"
+HOST="${AVM_UPLOAD_HOST:-127.0.0.1}"
+REMOTE="${GRAFT_AVM_UPLOAD_URL:-}"
+AVM_STORE="${GRAFT_AVM_STORE:-${AVM_PKG_STORE:-$PWD/avm-store}}"
+AVM_PKG_BIN="${AVM_PKG_BIN:-}"
+VERIFY_BIN="${AVM_UPLOAD_VERIFY_BIN:-${AVM_UPLOAD_BIN:-}}"
+CLI_SIGNERS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --store) AVM_STORE="$2"; shift 2 ;;
+    --upload-root) UPLOAD_ROOT="$2"; shift 2 ;;
+    --remote) REMOTE="$2"; shift 2 ;;
+    --signer) CLI_SIGNERS+=("$2"); shift 2 ;;
+    --signers-file) SIGNERS_FILE="$2"; shift 2 ;;
+    --help|-h)
+      cat <<'USAGE'
+usage: graft-avm-import [options]
+
+  --store DIR        host avm-pkg store (default: $AVM_PKG_STORE or ./avm-store)
+  --upload-root DIR  avm-uploadd root (default: $XDG_STATE_HOME/graft/avm/upload-cache)
+  --remote URL       token-bearing upload URL (default: derived from upload.token)
+  --signer HEX       allowed Ed25519 public key (repeatable)
+  --signers-file FILE  allowlist, one 64-hex public key per line
+USAGE
+      exit 0
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -d "$AVM_STORE/index" ]] || die "not an initialized avm-pkg store: $AVM_STORE"
+mkdir -p "$STATE_ROOT" "$UPLOAD_ROOT/imported"
+
+if [[ -z "$AVM_PKG_BIN" ]]; then
+  AVM_PKG_BIN="$(command -v avm-pkg || true)"
+  if [[ -z "$AVM_PKG_BIN" && -x "$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg" ]]; then
+    AVM_PKG_BIN="$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg"
+  fi
+fi
+[[ -n "$AVM_PKG_BIN" && -x "$AVM_PKG_BIN" ]] || die "avm-pkg not found; set AVM_PKG_BIN"
+
+if [[ -z "$REMOTE" ]]; then
+  [[ -s "$TOKEN_FILE" ]] || die "missing token file: $TOKEN_FILE (run graft-avm-init)"
+  TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  [[ "$TOKEN" =~ ^[0-9a-f]{64}$ ]] || die "invalid token in $TOKEN_FILE"
+  REMOTE="http://$HOST:$PORT/$TOKEN"
+fi
+
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$STATE_ROOT/.import.lock"
+  flock -w 300 9 || die "another graft-avm-import is still running"
+fi
+
+mapfile -t MANIFESTS < <(
+  find "$UPLOAD_ROOT/manifests" -type f \
+    -name '????????????????????????????????????????????????????????????????' 2>/dev/null |
+    LC_ALL=C sort
+)
+
+SIGNERS=()
+if [[ ${#MANIFESTS[@]} -gt 0 ]]; then
+  if [[ -z "$VERIFY_BIN" ]]; then
+    VERIFY_BIN="$(command -v avm-uploadd || true)"
+  fi
+  if [[ -z "$VERIFY_BIN" && -x "$REPO_ROOT/target/release/avm-uploadd" ]]; then
+    VERIFY_BIN="$REPO_ROOT/target/release/avm-uploadd"
+  fi
+  if [[ -z "$VERIFY_BIN" && -x "$REPO_ROOT/target/debug/avm-uploadd" ]]; then
+    VERIFY_BIN="$REPO_ROOT/target/debug/avm-uploadd"
+  fi
+  [[ -n "$VERIFY_BIN" && -x "$VERIFY_BIN" ]] ||
+    die "avm-uploadd not found; set AVM_UPLOAD_VERIFY_BIN"
+
+  if [[ -n "$SIGNERS_SPEC" ]]; then
+    read -r -a FROM_ENV <<< "${SIGNERS_SPEC//,/ }"
+    SIGNERS+=("${FROM_ENV[@]}")
+  fi
+  if [[ -f "$SIGNERS_FILE" ]]; then
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="$(printf '%s' "$line" | tr -d '[:space:]')"
+      if [[ -n "$line" ]]; then
+        SIGNERS+=("$line")
+      fi
+    done < "$SIGNERS_FILE"
+  fi
+  SIGNERS+=("${CLI_SIGNERS[@]}")
+  [[ ${#SIGNERS[@]} -gt 0 ]] ||
+    die "refusing ${#MANIFESTS[@]} pending upload(s): no allowed signers in $SIGNERS_FILE"
+  for signer in "${SIGNERS[@]}"; do
+    [[ "$signer" =~ ^[0-9a-f]{64}$ ]] ||
+      die "invalid allowed signer: $signer (expected 64 lowercase hex characters)"
+  done
+fi
+
+count=0
+for manifest in "${MANIFESTS[@]}"; do
+  id="$(basename "$manifest")"
+  [[ "$id" =~ ^[0-9a-f]{64}$ ]] || continue
+  VERIFY_ARGS=(verify-manifest --id "$id" --manifest "$manifest")
+  for signer in "${SIGNERS[@]}"; do
+    VERIFY_ARGS+=(--allow "$signer")
+  done
+  "$VERIFY_BIN" "${VERIFY_ARGS[@]}" >/dev/null ||
+    die "refusing $id: signature verification failed"
+  log "importing $id (signature verified)"
+  "$AVM_PKG_BIN" --store "$AVM_STORE" pull "$id" --remote "$REMOTE" >/dev/null
+  mv "$manifest" "$UPLOAD_ROOT/imported/$id"
+  count=$((count + 1))
+done
+
+log "imported $count manifest(s)"

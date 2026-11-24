@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# verify-avm-upload — start avm-uploadd, push with avm-pkg, import through
+# avm-pkg pull, and compare the reconstructed package.
+set -euo pipefail
+
+die() { printf 'verify-avm-upload: %s\n' "$*" >&2; exit 1; }
+log() { printf 'verify-avm-upload: %s\n' "$*" >&2; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+TMP="${VERIFY_ROOT:-$REPO_ROOT/target/openshell-avm-upload-verify}"
+AVM_PKG_BIN="${AVM_PKG_BIN:-}"
+UPLOADD="${AVM_UPLOAD_BIN:-$REPO_ROOT/target/debug/avm-uploadd}"
+
+if [[ -z "$AVM_PKG_BIN" ]]; then
+  AVM_PKG_BIN="$(command -v avm-pkg || true)"
+fi
+if [[ -z "$AVM_PKG_BIN" && -x "$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg" ]]; then
+  AVM_PKG_BIN="$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg"
+fi
+[[ -n "$AVM_PKG_BIN" && -x "$AVM_PKG_BIN" ]] || die "avm-pkg not found; set AVM_PKG_BIN"
+[[ -x "$UPLOADD" ]] || die "avm-uploadd not built at $UPLOADD; run cargo build -p avm-uploadd"
+command -v curl >/dev/null 2>&1 || die "curl is required for readiness checks"
+
+rm -rf "$TMP"
+mkdir -p "$TMP"
+STATE="$TMP/state"
+PORT=$((20000 + RANDOM % 20000))
+AVM_PKG_BIN="$(readlink -f "$AVM_PKG_BIN")"
+UPLOADD="$(readlink -f "$UPLOADD")"
+SERVER_PID=""
+cleanup() {
+  if [[ -n "$SERVER_PID" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+INIT="$(GRAFT_AVM_STATE="$STATE" AVM_UPLOAD_PORT="$PORT" "$SCRIPT_DIR/graft-avm-init")"
+URL="$(printf '%s\n' "$INIT" | sed -n 's/^local_url=//p')"
+TOKEN_FILE="$STATE/upload.token"
+SIGNERS_FILE="$STATE/upload-allowed-signers"
+[[ -n "$URL" ]] || die "graft-avm-init did not print a URL"
+
+SEED="$(printf '11%.0s' {1..32})"
+WRONG_SEED="$(printf '22%.0s' {1..32})"
+SIGNER="$("$UPLOADD" signer-pubkey --seed "$SEED")"
+[[ "$SIGNER" =~ ^[0-9a-f]{64}$ ]] || die "uploadd did not derive a signer key"
+printf '%s\n' "$SIGNER" > "$SIGNERS_FILE"
+
+AVM_UPLOAD_BIND="127.0.0.1:$PORT" AVM_UPLOAD_ROOT="$STATE/upload-cache" \
+  "$UPLOADD" --root "$STATE/upload-cache" --token-file "$TOKEN_FILE" \
+  >"$TMP/uploadd.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 50); do
+  if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null ||
+  { cat "$TMP/uploadd.log" >&2; die "avm-uploadd did not become ready"; }
+
+"$AVM_PKG_BIN" --store "$TMP/sender" init >/dev/null
+printf 'authenticated upload verification payload\n' > "$TMP/payload"
+MANIFEST="$("$AVM_PKG_BIN" --store "$TMP/sender" put "$TMP/payload" --name verified --version 1.0.0 --sign "$SEED" | awk '{print $1}')"
+[[ "$MANIFEST" =~ ^[0-9a-f]{64}$ ]] || die "put did not return a manifest digest"
+
+"$AVM_PKG_BIN" --store "$TMP/sender" push "$MANIFEST" --remote "$URL" >/dev/null
+[[ -f "$STATE/upload-cache/manifests/${MANIFEST:0:2}/$MANIFEST" ]] ||
+  die "server did not stage the pushed manifest"
+
+WRONG="$(printf '0%.0s' {1..64})"
+STATUS="$(curl -s -o /dev/null -w '%{http_code}' \
+  "http://127.0.0.1:$PORT/$WRONG/chunks/$MANIFEST")"
+[[ "$STATUS" == "404" ]] || die "wrong token returned HTTP $STATUS"
+
+"$AVM_PKG_BIN" --store "$TMP/receiver" init >/dev/null
+import_staged() {
+  GRAFT_AVM_STATE="$STATE" GRAFT_AVM_STORE="$TMP/receiver" \
+    GRAFT_AVM_UPLOAD_ROOT="$STATE/upload-cache" AVM_PKG_BIN="$AVM_PKG_BIN" \
+    AVM_UPLOAD_VERIFY_BIN="$UPLOADD" AVM_UPLOAD_PORT="$PORT" \
+    "$SCRIPT_DIR/graft-avm-import"
+}
+
+expect_rejected() {
+  local label="$1" manifest="$2"
+  set +e
+  import_staged >"$TMP/$label.out" 2>"$TMP/$label.err"
+  local status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || die "$label upload was accepted"
+  [[ -f "$STATE/upload-cache/manifests/${manifest:0:2}/$manifest" ]] ||
+    die "$label upload was removed instead of being rejected"
+  rm -f "$STATE/upload-cache/manifests/${manifest:0:2}/$manifest"
+}
+
+import_staged
+
+"$AVM_PKG_BIN" --store "$TMP/receiver" get "$MANIFEST" -o "$TMP/out" >/dev/null
+cmp "$TMP/payload" "$TMP/out"
+[[ -f "$STATE/upload-cache/imported/$MANIFEST" ]] ||
+  die "imported manifest was not moved out of the staging area"
+
+printf 'unsigned upload verification payload\n' > "$TMP/unsigned"
+UNSIGNED="$("$AVM_PKG_BIN" --store "$TMP/sender" put "$TMP/unsigned" --name unsigned --version 1.0.0 | awk '{print $1}')"
+"$AVM_PKG_BIN" --store "$TMP/sender" push "$UNSIGNED" --remote "$URL" >/dev/null
+expect_rejected unsigned "$UNSIGNED"
+grep -q 'unsigned' "$TMP/unsigned.err" || die "unsigned rejection did not name the signature"
+
+printf 'wrong signer verification payload\n' > "$TMP/wrong"
+WRONG="$("$AVM_PKG_BIN" --store "$TMP/sender" put "$TMP/wrong" --name wrong --version 1.0.0 --sign "$WRONG_SEED" | awk '{print $1}')"
+"$AVM_PKG_BIN" --store "$TMP/sender" push "$WRONG" --remote "$URL" >/dev/null
+expect_rejected wrong "$WRONG"
+grep -q 'not allowed' "$TMP/wrong.err" || die "wrong-signer rejection did not name the signer"
+
+log "authenticated push, signature enforcement, import, and pull verified"
+printf 'manifest=%s\n' "$MANIFEST"

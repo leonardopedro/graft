@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# graft-avm-init — create the authenticated upload cache token and directories.
+#
+# Safe to rerun: an existing token is retained.
+set -euo pipefail
+
+die() { printf 'graft-avm-init: %s\n' "$*" >&2; exit 1; }
+
+STATE_ROOT="${GRAFT_AVM_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/graft/avm}"
+TOKEN_FILE="${GRAFT_AVM_UPLOAD_TOKEN_FILE:-$STATE_ROOT/upload.token}"
+SIGNERS_FILE="${GRAFT_AVM_UPLOAD_SIGNERS_FILE:-$STATE_ROOT/upload-allowed-signers}"
+UPLOAD_ROOT="${GRAFT_AVM_UPLOAD_ROOT:-$STATE_ROOT/upload-cache}"
+PORT="${AVM_UPLOAD_PORT:-18090}"
+
+umask 077
+mkdir -p "$STATE_ROOT" "$UPLOAD_ROOT/chunks" "$UPLOAD_ROOT/manifests" "$UPLOAD_ROOT/imported"
+
+if [[ ! -s "$TOKEN_FILE" ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32 > "$TOKEN_FILE"
+  else
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$TOKEN_FILE"
+  fi
+else
+  chmod 600 "$TOKEN_FILE"
+fi
+if [[ ! -e "$SIGNERS_FILE" ]]; then
+  : > "$SIGNERS_FILE"
+fi
+chmod 600 "$SIGNERS_FILE"
+
+TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+[[ "$TOKEN" =~ ^[0-9a-f]{64}$ ]] || die "$TOKEN_FILE does not contain 64 hex characters"
+
+printf 'state=%s\n' "$STATE_ROOT"
+printf 'token_file=%s\n' "$TOKEN_FILE"
+printf 'signers_file=%s\n' "$SIGNERS_FILE"
+printf 'upload_root=%s\n' "$UPLOAD_ROOT"
+printf 'local_url=http://127.0.0.1:%s/%s\n' "$PORT" "$TOKEN"
+printf 'guest_url=http://host.openshell.internal:%s/%s\n' "$PORT" "$TOKEN"

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# openshell-avm — run avm-pkg in an OpenShell microVM using the host's
+# Graft-published, read-only avm-pkg store.
+#
+#   ./openshell-avm get <manifest-hex> -o /workspace/package.bin
+#   ./openshell-avm
+#
+# The guest gets three mounts on x86_64 (the driver's limit):
+#
+#   /nix                 ro   host Nix store; supplies the avm-pkg loader/libs
+#   /opt/graft-packages  ro   the current Graft deployment (store + avm-pkg)
+#   /workspace           rw   the directory you pass as PROJECTS_DIR
+#
+# Every sandbox mounts the same deployment. No package bytes or avm-pkg binary
+# are copied into a guest image. A new host sync produces a new deployment path;
+# new sandboxes pick it up automatically.
+set -euo pipefail
+
+die() { printf 'openshell-avm: %s\n' "$*" >&2; exit 1; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SYNC="$SCRIPT_DIR/graft-avm-sync"
+POLICY_FILE="${POLICY_FILE:-$SCRIPT_DIR/sandbox-policy.yaml}"
+STATE_ROOT="${GRAFT_AVM_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/graft/avm}"
+TOKEN_FILE="${GRAFT_AVM_UPLOAD_TOKEN_FILE:-$STATE_ROOT/upload.token}"
+UPLOAD_URL="${AVM_UPLOAD_URL:-}"
+UPLOAD_HOST="${AVM_UPLOAD_HOST:-host.openshell.internal}"
+UPLOAD_PORT="${AVM_UPLOAD_PORT:-18090}"
+
+if [[ -z "$UPLOAD_URL" && -s "$TOKEN_FILE" ]]; then
+  UPLOAD_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
+  if [[ "$UPLOAD_TOKEN" =~ ^[0-9a-f]{64}$ ]]; then
+    UPLOAD_URL="http://$UPLOAD_HOST:$UPLOAD_PORT/$UPLOAD_TOKEN"
+  else
+    printf 'openshell-avm: ignoring invalid upload token in %s\n' "$TOKEN_FILE" >&2
+  fi
+fi
+[[ -z "$UPLOAD_URL" || "$UPLOAD_URL" =~ ^[A-Za-z0-9:/._~-]+$ ]] ||
+  die "AVM_UPLOAD_URL contains unsupported characters"
+
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
+SANDBOX_NAME="${SANDBOX_NAME:-avm}"
+SHARE_NIX="${SHARE_NIX:-1}"
+GUEST_PROGRAM="avm-pkg"
+if [[ "${1:-}" == "shell" ]]; then
+  GUEST_PROGRAM="sh"
+  shift
+elif [[ "${1:-}" == "upload" ]]; then
+  GUEST_PROGRAM="avm-pkg-upload"
+  shift
+fi
+
+[[ -x "$SYNC" ]] || die "missing executable: $SYNC"
+[[ -f "$POLICY_FILE" ]] || die "missing policy: $POLICY_FILE"
+[[ -d "$PROJECTS_DIR" ]] || die "PROJECTS_DIR does not exist: $PROJECTS_DIR"
+PROJECTS_DIR="$(readlink -f "$PROJECTS_DIR")"
+
+if [[ -n "${GRAFT_AVM_DEPLOYMENT:-}" ]]; then
+  DEPLOYMENT="$(readlink -f "$GRAFT_AVM_DEPLOYMENT")"
+  [[ -d "$DEPLOYMENT/store" ]] || die "not a deployment tree: $DEPLOYMENT"
+else
+  [[ -n "${GRAFT_AVM_STORE:-${AVM_PKG_STORE:-}}" ]] ||
+    die "set GRAFT_AVM_STORE to the host avm-pkg store, or GRAFT_AVM_DEPLOYMENT to an existing deployment"
+  command -v openshell >/dev/null 2>&1 || die "openshell not on PATH"
+  DEPLOYMENT="$(GRAFT_AVM_DEPLOY_ROOT="${GRAFT_AVM_DEPLOY_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/graft/avm/runtime}" "$SYNC")"
+  DEPLOYMENT="$(readlink -f "$DEPLOYMENT")"
+fi
+[[ -d "$DEPLOYMENT/store" ]] || die "deployment has no store/: $DEPLOYMENT"
+[[ -x "$DEPLOYMENT/bin/avm-pkg" ]] || die "deployment has no bin/avm-pkg: $DEPLOYMENT"
+if [[ "$GUEST_PROGRAM" == "avm-pkg-upload" ]]; then
+  [[ -x "$DEPLOYMENT/bin/avm-pkg-upload" ]] || die "deployment has no bin/avm-pkg-upload: $DEPLOYMENT"
+fi
+
+for path in "$DEPLOYMENT" "$PROJECTS_DIR"; do
+  [[ "$path" != *'"'* && "$path" != *"'"* && "$path" != *\\* && "$path" != *$'\n'* ]] ||
+    die "path contains a quote, backslash, or newline: $path"
+done
+
+MOUNTS="["
+SEPARATOR=""
+if [[ "$SHARE_NIX" == 1 && -d /nix ]]; then
+  MOUNTS+="{\"type\":\"bind\",\"source\":\"/nix\",\"target\":\"/nix\",\"read_only\":true}"
+  SEPARATOR=","
+fi
+MOUNTS+="$SEPARATOR{\"type\":\"bind\",\"source\":\"$DEPLOYMENT\",\"target\":\"/opt/graft-packages\",\"read_only\":true}"
+MOUNTS+=",{\"type\":\"bind\",\"source\":\"$PROJECTS_DIR\",\"target\":\"/workspace\",\"read_only\":false}]"
+DRIVER_CONFIG="{\"vm\":{\"mounts\":$MOUNTS}}"
+
+# Read-only store by default. A write command must name a writable store
+# explicitly, e.g. `--store /workspace/.avm-store`, so a guest can never mutate
+# the shared package tree. `$PATH` and `$@` must expand in the guest, not here.
+# shellcheck disable=SC2016
+GUEST_CMD='export PATH=/opt/graft-packages/bin:$PATH; export AVM_PKG_STORE=/opt/graft-packages/store; '
+# shellcheck disable=SC2016
+GUEST_CMD+="cd /workspace 2>/dev/null || cd /; exec $GUEST_PROGRAM \"\$@\""
+
+ENV_ARGS=()
+if [[ -n "$UPLOAD_URL" ]]; then
+  # --env-from keeps the token out of the sandbox's command-line arguments.
+  ENV_ARGS=(--env-from AVM_UPLOAD_URL)
+fi
+if [[ -n "${AVM_PKG_SIGNING_SEED:-}" ]]; then
+  # Optional package-signing seed for builders; still absent from argv.
+  ENV_ARGS+=(--env-from AVM_PKG_SIGNING_SEED)
+fi
+
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  printf "openshell sandbox create --name %q \\\\\n  --driver-config-json '%s' \\\\\n  --policy %q" \
+    "$SANDBOX_NAME" "$DRIVER_CONFIG" "$POLICY_FILE" >&2
+  if [[ ${#ENV_ARGS[@]} -gt 0 ]]; then
+    printf ' %q' "${ENV_ARGS[@]}" >&2
+  fi
+  printf " \\\\\n  -- sh -c %q sh" "$GUEST_CMD" >&2
+  if [[ $# -gt 0 ]]; then
+    printf ' %q' "$@" >&2
+  fi
+  printf '\n' >&2
+  printf '%s\n' "$DEPLOYMENT"
+  exit 0
+fi
+
+command -v openshell >/dev/null 2>&1 || die "openshell not on PATH"
+if [[ -z "${OPENSHELL_GATEWAY:-}" && -z "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]]; then
+  printf 'openshell-avm: using the selected gateway; set OPENSHELL_GATEWAY=local to choose one explicitly\n' >&2
+fi
+
+OPENSHELL_ARGS=(sandbox create --name "$SANDBOX_NAME" \
+  --driver-config-json "$DRIVER_CONFIG" \
+  --policy "$POLICY_FILE" \
+  "${ENV_ARGS[@]}" \
+  -- sh -c "$GUEST_CMD" sh "$@")
+if [[ -n "$UPLOAD_URL" ]]; then
+  exec env AVM_UPLOAD_URL="$UPLOAD_URL" openshell "${OPENSHELL_ARGS[@]}"
+fi
+exec openshell "${OPENSHELL_ARGS[@]}"

@@ -1,0 +1,56 @@
+[package]
+name = "graft-workspace"
+version = "0.1.0"
+edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+description = "Workspace catalog on Graft: a SQLite catalog volume plus the lane CLI."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "workspace"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+cdc-volume = { path = "../cdc-volume" }
+bs58 = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+config = { workspace = true, features = ["toml"] }
+ed25519-dalek = { workspace = true }
+futures = { workspace = true }
+graft = { path = "../graft" }
+graft-sqlite = { path = "../graft-sqlite" }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+loro = { workspace = true }
+opendal = { workspace = true, features = ["blocking"] }
+rand = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "http2", "rustls-tls"] }
+rusqlite = { workspace = true, features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+zstd = { workspace = true }
+sha2 = { workspace = true }
+sqlite-plugin = { workspace = true, features = ["static"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "net"] }
+url = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+h2 = "0.4"
+rcgen = "0.14"
+tempfile = { workspace = true }

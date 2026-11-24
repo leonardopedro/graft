@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# verify-avm-store — host-side acceptance for the Graft + avm-pkg + OpenShell
+# integration. It does not need a running OpenShell gateway; it proves the
+# exact store tree the VM mounts is readable after being made read-only, and
+# that successive syncs reuse most Graft chunks.
+set -euo pipefail
+
+die() { printf 'verify-avm-store: %s\n' "$*" >&2; exit 1; }
+log() { printf 'verify-avm-store: %s\n' "$*" >&2; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+TMP="${VERIFY_ROOT:-$REPO_ROOT/target/openshell-avm-verify}"
+AVM_PKG_BIN="${AVM_PKG_BIN:-}"
+WORKSPACE_BIN="${GRAFT_WORKSPACE_BIN:-$REPO_ROOT/target/debug/workspace}"
+
+if [[ -z "$AVM_PKG_BIN" ]]; then
+  AVM_PKG_BIN="$(command -v avm-pkg || true)"
+fi
+if [[ -z "$AVM_PKG_BIN" && -x "$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg" ]]; then
+  AVM_PKG_BIN="$REPO_ROOT/../australVM/safestos/pkg/target/release/avm-pkg"
+fi
+[[ -n "$AVM_PKG_BIN" && -x "$AVM_PKG_BIN" ]] || die "avm-pkg not found; set AVM_PKG_BIN"
+[[ -x "$WORKSPACE_BIN" ]] || die "workspace not built at $WORKSPACE_BIN; run cargo build -p graft-workspace --bin workspace"
+
+chmod -R u+w "$TMP" 2>/dev/null || true
+rm -rf "$TMP"
+mkdir -p "$TMP"
+trap 'chmod -R u+w "$TMP" 2>/dev/null || true' EXIT
+STORE="$TMP/host-store"
+STATE="$TMP/state"
+AVM_PKG_BIN="$(readlink -f "$AVM_PKG_BIN")"
+WORKSPACE_BIN="$(readlink -f "$WORKSPACE_BIN")"
+
+"$AVM_PKG_BIN" --store "$STORE" init >/dev/null
+printf 'first package payload\n' > "$TMP/first.txt"
+FIRST="$("$AVM_PKG_BIN" --store "$STORE" put "$TMP/first.txt" --name first --version 1.0.0 | awk '{print $1}')"
+[[ "$FIRST" =~ ^[0-9a-f]{64}$ ]] || die "put did not return a manifest digest: $FIRST"
+
+sync_once() {
+  GRAFT_AVM_STORE="$STORE" \
+  GRAFT_AVM_STATE="$STATE" \
+  GRAFT_AVM_REPO="fs:$STATE/repo" \
+  GRAFT_AVM_DEPLOY_ROOT="$STATE/runtime" \
+  GRAFT_WORKSPACE_BIN="$WORKSPACE_BIN" \
+  AVM_PKG_BIN="$AVM_PKG_BIN" \
+    "$SCRIPT_DIR/graft-avm-sync"
+}
+
+DEPLOYMENT="$(sync_once)"
+[[ -d "$DEPLOYMENT/store" ]] || die "no deployed store"
+[[ -x "$DEPLOYMENT/bin/avm-pkg-upload" ]] || die "deployment lacks avm-pkg-upload"
+log "deployment 1: $DEPLOYMENT"
+
+chmod -R a-w "$DEPLOYMENT/store" "$DEPLOYMENT/bin"
+"$AVM_PKG_BIN" --store "$DEPLOYMENT/store" get "$FIRST" -o "$TMP/first.out" >/dev/null
+cmp "$TMP/first.txt" "$TMP/first.out"
+log "read-only store served the first package"
+
+printf 'second package payload, sharing the same pack\n' > "$TMP/second.txt"
+SECOND="$("$AVM_PKG_BIN" --store "$STORE" put "$TMP/second.txt" --name second --version 1.0.0 | awk '{print $1}')"
+[[ "$SECOND" =~ ^[0-9a-f]{64}$ ]] || die "second put did not return a manifest digest: $SECOND"
+
+SYNC_LOG="$TMP/sync2.log"
+DEPLOYMENT2="$(sync_once 2>"$SYNC_LOG")"
+[[ "$DEPLOYMENT2" != "$DEPLOYMENT" ]] || die "second sync reused the deployment id"
+log "deployment 2: $DEPLOYMENT2"
+grep -q 'reused: [1-9]' "$SYNC_LOG" || {
+  cat "$SYNC_LOG" >&2
+  die "second sync did not reuse any Graft chunks"
+}
+log "second sync reused chunks: $(grep -o 'reused: [0-9]*' "$SYNC_LOG" | head -1)"
+
+chmod -R a-w "$DEPLOYMENT2/store" "$DEPLOYMENT2/bin"
+"$AVM_PKG_BIN" --store "$DEPLOYMENT2/store" get "$FIRST" -o "$TMP/first2.out" >/dev/null
+"$AVM_PKG_BIN" --store "$DEPLOYMENT2/store" get "$SECOND" -o "$TMP/second2.out" >/dev/null
+cmp "$TMP/first.txt" "$TMP/first2.out"
+cmp "$TMP/second.txt" "$TMP/second2.out"
+log "read-only deployment served both packages"
+
+printf 'deployment=%s\nmanifest=%s\n' "$DEPLOYMENT2" "$SECOND"

@@ -1,0 +1,21 @@
+[Unit]
+Description=Publish the host avm-pkg store through Graft
+After=graft-avm-uploadd.service
+Wants=graft-avm-uploadd.service
+
+[Service]
+Type=oneshot
+Environment=GRAFT_AVM_STATE=@STATE@
+Environment=GRAFT_AVM_STORE=@STORE@
+Environment=GRAFT_AVM_DEPLOY_ROOT=@STATE@/runtime
+Environment=GRAFT_AVM_IMPORT_ROOT=@STATE@/upload-cache
+Environment=GRAFT_WORKSPACE_BIN=@WORKSPACE@
+Environment=AVM_PKG_BIN=@AVM_PKG@
+Environment=AVM_UPLOAD_VERIFY_BIN=@UPLOADD@
+ExecStart=@REPO@/integrations/openshell/graft-avm-sync
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=@STATE@ @STORE@

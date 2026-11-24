@@ -1,0 +1,19 @@
+[Unit]
+Description=Authenticated avm-pkg upload cache for OpenShell
+After=network.target
+
+[Service]
+Type=simple
+Environment=AVM_UPLOAD_BIND=127.0.0.1:18090
+Environment=AVM_UPLOAD_ROOT=@STATE@/upload-cache
+Environment=AVM_UPLOAD_TOKEN_FILE=@STATE@/upload.token
+ExecStart=@UPLOADD@ --root @STATE@/upload-cache --token-file @STATE@/upload.token
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=@STATE@
+
+[Install]
+WantedBy=default.target
