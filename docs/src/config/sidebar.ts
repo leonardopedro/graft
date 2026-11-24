@@ -32,6 +32,7 @@ export const sidebar = [
     items: [
       { label: "Volumes", slug: "docs/concepts/volumes" },
       { label: "Consistency", slug: "docs/concepts/consistency" },
+      { label: "Storage layout", slug: "docs/concepts/layout" },
     ],
   },
   {
@@ -46,6 +47,20 @@ export const sidebar = [
       {
         label: "Using with...",
         items: [{ autogenerate: { directory: "docs/sqlite/usage" } }],
+      },
+    ],
+  },
+  {
+    label: "Workspace",
+    collapsed: true,
+    items: [
+      { label: "Quick start", slug: "docs/workspace/quickstart" },
+      { label: "Clone a workspace", slug: "docs/workspace/clone" },
+      { label: "Binary updates", slug: "docs/workspace/updates" },
+      { label: "CLI usage", slug: "docs/workspace" },
+      {
+        label: "CLI reference",
+        items: [{ autogenerate: { directory: "docs/workspace/cli" } }],
       },
     ],
   },

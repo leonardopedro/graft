@@ -29,6 +29,104 @@ jobs:
         uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5
         with:
           paths_ignore: '["**.md", "docs/**"]'
+  docs-examples:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev
+          version: 1.0
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          token: ${{secrets.GITHUB_TOKEN}}
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      # Runs the commands from the workspace guides and checks that every
+      # example and stable transcript still appears on its page. This job is
+      # intentionally not gated by skip-check: a docs-only change must run it.
+      - name: Guide doc examples
+        run: cargo test -p graft-workspace --test doc_examples
+
+  service-files:
+    name: Service files (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    env:
+      GRAFT_REQUIRE_SERVICE_PARSER: "1"
+    steps:
+      - name: system dependencies
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev
+          version: 1.0
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          token: ${{secrets.GITHUB_TOKEN}}
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      # systemd-analyze on Linux, plutil on macOS. The generated files are
+      # otherwise only checked for expected substrings in unit tests.
+      - name: Validate generated service files
+        run: cargo test -p graft-workspace --test service_files
+
+  openshell-integration:
+    runs-on: ubuntu-24.04
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    steps:
+      - name: system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: clang libclang-dev llvm libncurses-dev build-essential libreadline-dev shellcheck
+          version: 1.0
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          token: ${{secrets.GITHUB_TOKEN}}
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      # The avm-pkg remote/CLI is developed in australVM. It is public, so the
+      # smoke test uses the real push/pull protocol rather than a mock.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: leonardopedro/australVM
+          path: .australvm
+          token: ${{secrets.GITHUB_TOKEN}}
+          persist-credentials: false
+
+      - name: Build avm-pkg
+        run: cargo build --release --manifest-path .australvm/safestos/pkg/Cargo.toml -p avm-cli
+
+      - name: OpenShell integration smoke
+        env:
+          AVM_PKG_BIN: ${{ github.workspace }}/.australvm/safestos/pkg/target/release/avm-pkg
+        run: integrations/openshell/ci-smoke
+
   build:
     runs-on: ubuntu-24.04
     needs: skip-check

@@ -5,6 +5,10 @@ checkouts `../unfer`, `../australVM`, `../emthin`. It replaces the Cloudflare-sp
 "parallel multi-lane workspace" draft with the same four-lane idea routed onto the storage
 and runtime pieces these four repos actually have.
 
+Binary update distribution is a separate surface built on the same FastCDC and
+content-addressed storage primitives; its plan and implementation status live in
+[`BINARY_UPDATES_PLAN.md`](BINARY_UPDATES_PLAN.md).
+
 The short version:
 
 - **`graft` is the control plane**, not a fourth storage product to invent. One Graft volume
@@ -96,7 +100,7 @@ Design rules:
 | Lane | Data | Engine | Hot store | Cold / public | Client surface |
 |---|---|---|---|---|---|
 | **Catalog** | paths, kinds, hashes, permissions, cross-lane links | SQLite on Graft VFS | catalog volume (`ws-catalog` tag) + DO-less daemon | `graft_export` snapshot / datapackage | `uw_catalog_*`, read-only `graft-sqlite` replica |
-| **1 — Live** | notes, specs, RFCs, whiteboards, agent scratchpads | Loro (`loro` 1.13 in unfer; `mathed` in emthin) | per-doc append-only oplog (`loro/oplog/<doc>/<lsn>`) | compacted snapshot (`loro/snap/<doc>/<frontier>`), markdown export | emthin `collab_*`; `unfer_ffi::durable` |
+| **1 — Live** | notes, specs, RFCs, whiteboards, agent scratchpads | Loro (`loro` 1.13 in unfer; `mathed` in emthin) | per-doc sequenced frame log in the oplog volume (`<catalog_tag>-oplog`), not one object per frame | compacted snapshot + frontier on the catalog entry, markdown export | `workspace doc *`; emthin `collab_*`; `unfer_ffi::durable` |
 | **2 — Versioned code** | source, configs, schemas, module manifests | Phase 4a: tree manifests + git bundle. Phase 4b: `jj-lib` | `cdc-volume` tree objects + bundles; jj objects later | git bundle / jj export per release | `uw_code_*`; `jj` CLI locally |
 | **3 — Media** | photos, video, audio, model weights, datasets | raw S3 objects (Range); `cdc-volume` for archives | `media/raw/<hash>`; `media/cdc/<tag>` | dataset/media bundles to Zenodo | `uw_blob_*` |
 | **4 — Archive** | milestones, DOIs, frozen bundles | `uz_*` Zenodo client | Zenodo draft/version | published record + DOI | `uw_release_*` |
@@ -183,14 +187,21 @@ This is what exists today; the phases below build only on these seams.
 - The collaboration protocol is fully specified in `docs/ipc.md:141-190`: opaque version
   token, join with version, sequenced delta frames with buffering/dup detection, ack-driven
   retention, leave.
-- The call sites define the missing crate's API: `emthin_collab::Session::new(peer, kind,
-  retain_ms)`, `local_edit(&MathDoc)`, `receive(&mut MathDoc, peer, seq, &[u8])` →
-  `ReceiveOutcome::{Applied{outbound,..}, Duplicate, Gap{expected}}`, `ack`, `leave`,
-  `has_peer`, `version` (`crates/emthin/src/state/mod.rs:338,451,521`;
-  `crates/emthin/src/ipc/dispatch.rs:71-150`).
-- **`crates/emthin-collab` does not exist.** `cargo metadata` fails today:
-  `failed to load manifest for dependency emthin-collab`. This is Phase 0 work, not an
-  optional nicety.
+- **`crates/emthin-collab` exists again** (`Exchange`, `Line`, `Session`, `wire`,
+  `unix::Host`/`UnixLink`, grants, anchors; ~4.4k lines) and is wired into emthin's IPC as
+  `collab_*` with an end-to-end test in `crates/emthin/tests/collab_ipc.rs`. `cargo metadata`
+  succeeds. It is GPL-3.0, so graft must talk to it over a socket rather than link it.
+- **The compile blocker is gone.** `velysterm` was updated to `00f24a7` (2026-11-22), which
+  supplies the missing `MathDoc::{version_vector, export_delta_since, create_anchor,
+  resolve_anchor}` and `DocError::BadVersion`. `cargo check -p emthin-collab` succeeds, and
+  `cargo test -p emthin-collab` passes 65 tests. Phase 0's compile gate is green on the emthin
+  side; `cargo check -p emthin` still needs the `nix develop` shell for `glib-sys`.
+- Its transport is **not** graft's framing: `wire` is big-endian length + `u8` tag with
+  `Hello{peer,version}`, `Delta{seq,delta}`, `Ack`, `Presence` and v2 `HelloV2{share_id,
+  epoch}`/`Resync`/`DeltaV2`, while graft's `transport` uses little-endian length with
+  `Hello{doc,peer,cursors}`, `Delta`, `Ack`, `Bye`, `CaughtUp{frontier}` and `Error`. There
+  is no `transport.rs` and no graft reference anywhere in emthin. One side needs an adapter
+  before a client can reach `workspace serve`.
 
 ### Missing everywhere
 
@@ -266,14 +277,8 @@ CREATE TABLE releases (
   published_at INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE oplog_streams (
-  doc_id     TEXT NOT NULL,
-  peer       TEXT NOT NULL,
-  next_seq   INTEGER NOT NULL DEFAULT 1,
-  acked_seq  INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (doc_id, peer)
-) STRICT;
+-- sequencing, frames and acks live in the oplog volume (`crates/graft-workspace/sql/oplog.sql`),
+-- not in the catalog: ack traffic must not contend with catalog writes
 ```
 
 Notes:
@@ -324,6 +329,25 @@ its own repo green before the next starts.
 Goal: `cargo metadata`/build works across the four repos, the coordinator exists, and the
 catalog is queryable through Graft SQLite.
 
+> **Status (2026-11-22):** implemented in `crates/graft-workspace` — schema, migrations,
+> catalog API, `workspace` CLI (`init`, `status`, `entry`, `doc`, `blob`, `sync`, `pull`,
+> `share`, `clone`), unit/e2e tests and the `tests/sql/test_workspace_catalog.sql` fixture.
+> `workspace serve` now binds a Unix socket and relays framed `Hello`/`Delta`/`Ack`/`Bye`
+> messages: a joining client receives the oplog tail after its cursors, then live frames;
+> gaps are reported without dropping the connection. `tests/transport.rs` covers broadcast,
+> reconnect-from-cursor and gap handling. The emthin client that speaks this framing is
+> still Phase 1 work.
+>
+> Documentation lives in `docs/src/content/docs/docs/workspace/` (`quickstart.md`,
+> `clone.md`, `index.md`) and `concepts/layout.md`. One captured run backs the guides, and
+> `crates/graft-workspace/tests/doc_examples.rs` replays it: it asserts the stable
+> transcripts, checks that every executed command and output still appears on its page, and
+> verifies that all pages show the same workspace id and reference. `layout.md` is checked
+> against the real schema files and a live workspace. `tests/cli_docs.rs` regenerates the
+> CLI reference and fails if it is stale. CI runs the doc-example test in its own ungated
+> `docs-examples` job, so even a docs-only change is checked for guide drift, while
+> `docs-check.yml` builds the site and link-checks the built pages.
+
 Work:
 
 1. **Restore `emthin/crates/emthin-collab`.** Minimum viable crate implementing exactly the
@@ -353,6 +377,26 @@ Deliberately not in this phase: `uw_*` symbols, S3, Loro sync, media.
 Goal: two emthin instances (or emthin + an agent) edit the same document through the
 coordinator, with the same framing the IPC already defines, and survive restarts/offline.
 
+> **Status (2026-11-22):** the storage half is implemented in `crates/graft-workspace`:
+> `Oplog` (sequenced per-producer frames, `Applied`/`Duplicate`/`Gap`, cursors, monotonic
+> clamped acks, explicit prune, summaries) in its own Graft volume, and `Workspace::join` /
+> `submit` / `ack` / `note_snapshot` with `workspace doc *` commands. The coordinator side of
+> the socket transport is built (`workspace serve`, see Phase 0). Compaction is now
+> ack-guarded: `workspace doc compact --producer P --through N` deletes frames only when
+> every known consumer has acked through N, refuses a frontier the coordinator never
+> applied, and is covered end-to-end (`tests/cli.rs`) as well as in unit tests. Compaction
+> now materializes a Loro snapshot and stores it in the oplog before deleting anything;
+> joining clients behind its frontier receive a `Snapshot` frame, and backups carry the
+> same snapshot plus the remaining frame tail. Snapshots larger than one transport frame
+> use bounded begin/chunk/end frames plus a validated client-side `SnapshotAssembler`, so
+> compaction is not limited by document size. The tests cover a client that drops after
+> two chunks and reconnects from empty cursors, receiving a fresh complete stream; shutdown
+> now wakes and joins active connection threads. `workspace serve` runs that pass after 300
+> seconds without a committed frame or ack
+> (`--compact-after-secs`, `0` disables), and the oplog schema migrates v1 databases in
+> place. Not yet built: emthin's two-tier session persistence and client transport, and
+> WebSocket bridging.
+
 Work:
 
 1. **Two-tier persistence.** Keep `emthin`'s standalone `session.loro` for the no-workspace
@@ -364,9 +408,10 @@ Work:
    Reuse `unfer_ffi::durable::LoroDurableStore` semantics (dirty coalescing, atomic rename,
    corrupt-snapshot preservation) rather than inventing a second snapshot path.
 2. **Transport.** Add `emthin-collab/src/transport.rs`: framed frames
-   `Hello{peer, version}`, `Delta{peer, seq, bytes}`, `Ack{peer, seq}`, `Bye`. The coordinator
-   is a relay + durable oplog; ordering is per peer stream, exactly as `docs/ipc.md`
-   requires. Authentication is a workspace grant, not an ambient socket path.
+   `Hello{peer, version}`, `Snapshot{frontier, bytes}`, `Delta{peer, seq, bytes}`,
+   `Ack{peer, seq}`, `Bye`. The coordinator is a relay + durable oplog; ordering is per
+   peer stream, exactly as `docs/ipc.md` requires. Authentication is a workspace grant,
+   not an ambient socket path.
 3. **Coordinator sync loop.** `graft-workspace` gets a `loro` lane: `uw_doc_join`,
    `uw_doc_delta`, `uw_doc_ack` (internal for now; not in the public ABI until Phase 3).
    Broadcast to other peers, persist to the oplog, ack after fsync. Clients reconnect with
@@ -391,6 +436,28 @@ peer.
 
 Goal: upload a 2 GB video, stream it back with Range requests, dedup a re-upload, and keep
 it out of both the CRDT and the catalog volume.
+
+> **Status (2026-11-22):** raw ingest and range reads are implemented in
+> `crates/graft-workspace` (`[media]` config → its own object store, streaming ingest with
+> hash-while-writing, content-addressed canonical objects, catalog dedup, `blob put|get|ls|
+> show|sweep-staging|gc`). `blob gc` removes raw canonical objects that no entry references
+> and that no release pins, deleting the catalog row before the object so an interrupted
+> sweep leaves an orphan rather than a row whose bytes are gone. The `cdc` storage class is
+> now implemented: `[archive] key_file` opens a third, encrypted `cdc-volume` tagged
+> `<catalog_tag>-archive`; `blob put --storage cdc` chunks, deduplicates and AEAD-encrypts
+> the payload through that store; `blob get` range-reads `cdc` rows via the chunk index;
+> archive volume ids/logs are included in `share`, `clone`, `sync` and `pull`. Tests cover
+> dedup, ranges, archive-without-media, malformed keys, and an end-to-end
+> sync/share/clone round trip. `workspace blob gc-cdc` removes unreferenced `cdc` rows and
+> manifests, then rewrites the archive through `cdc-volume`'s mark-and-sweep and repoints
+> the tag at the copy; the old volume is kept for a grace period until the next sync or
+> clone. The rewrite re-keys chunk ids (the same shape a master-key rotation would take,
+> though the command keeps the configured key). Presigned ingest is exposed as
+> `blob presign` / `blob commit`: opendal's S3 backend issues a short-lived PUT, the client
+> supplies size and blake3, and commit accepts only this workspace's staging keys, checks
+> size, re-hashes while copying to canonical storage, drops staging, and dedups. Backends
+> without presign return `PresignUnsupported` and keep the streaming `blob put` path. Not
+> yet built: the `uw_blob_*` ABI over these operations, and scheduling GC automatically.
 
 Work:
 
@@ -421,10 +488,18 @@ Exit gate:
 
 Not in this phase: thumbnails, EXIF extraction, transcoding, CDN/CORS policy.
 
-### Phase 3 — Lane 4: archival publishing (M)
+### Phase 3 — Lane 4: archival publishing (M)Goal: one command turns a workspace milestone into a citable Zenodo record with a
+ datapackage, and external readers can fetch ranges without the daemon in the path.
 
-Goal: one command turns a workspace milestone into a citable Zenodo record with a
-datapackage, and external readers can fetch ranges without the daemon in the path.
+> **Status (2026-11-22):** bundle assembly is implemented in `crates/graft-workspace`:
+> `workspace release stage --entry <PATH> --out <DIR>` copies media blobs and every file in
+> selected code trees into `files/`, verifies each blake3 while copying, and writes
+> `datapackage.json` with blake3 + sha256, byte count, lane and entry path per resource. The
+> datapackage hash is the manifest hash; staging refuses a non-empty directory and paths
+> that escape it. Not built: the Zenodo bundle/deposit calls, gatekeeper approval, DOI rows
+> in `releases`, blob pinning on publish, and archive range reads. Those need `uz_*` work in
+> unfer, australVM bindings, and a sandbox token.
+
 
 Work:
 
@@ -477,6 +552,17 @@ largest risk in the whole design and is not needed for value.
 
 #### 4a — code snapshots without jj (M)
 
+> **Status (2026-11-22):** implemented as `workspace code snapshot` / `code restore` in
+> `crates/graft-workspace`. A checkpoint is a JSON tree manifest (path, blake3, size, mode)
+> stored in the encrypted `cdc-volume`; unchanged files dedup across checkpoints at chunk
+> level. Git trees are enumerated with `git ls-files --cached --others --exclude-standard`
+> and get a `git bundle` of all refs; other trees skip `.git` and honour
+> `.workspaceignore`. Restore streams in 64 KiB chunks, verifies each file's blake3 and size
+> before renaming it into place, and rejects `..`/absolute manifest paths. Checkpoint blobs
+> are pinned so `blob gc-cdc` cannot collect them. The archive volume is part of
+> `WorkspaceRef`/sync/clone, so checkpoints survive adoption; `[archive]` is now required
+> for this lane. 4b (`graft-jj`) is still gated and not started.
+
 1. `uw_code_snapshot(handle, path)`: walk a working tree, exclude via `.gitignore` plus an
    explicit `workspaceignore`, write each file to `cdc-volume` (dedup by content), write a
    tree manifest blob (sorted path → hash → mode/size), commit `entries(kind='file'|'dir',
@@ -522,6 +608,41 @@ Not in this phase: a hosted jj remote, `jj git push` automation, stacked reviews
 garbage collection across clients.
 
 ### Phase 5 — offline, backup, hardening (M)
+
+> **Status (2026-11-22):** the restore drill is in place as
+> `crates/graft-workspace/tests/restore_drill.rs`. It initialises a workspace, ingests a
+> media blob, checkpoints a code tree, syncs and shares, copies the media root, clones into
+> a fresh data directory, then reads the blob and restores the tree byte-for-byte from the
+> new store. It runs against `RemoteConfig::Fs`. `workspace backup` now exports a
+> consistent catalog snapshot, raw blob bytes, one verified git bundle per code checkpoint,
+> one ordered frame log per document, and a materialized Loro snapshot per document to a
+> separate `[backup]` store, writing `manifest.json` with object sizes and hashes last.
+> `workspace restore <prefix>` refuses a non-empty workspace, restores the catalog, streams
+> blobs to their original locators, replays frames, and verifies every object and snapshot.
+> Encrypted `cdc` blobs are skipped unless `[backup.archive]` names a separate Graft
+> remote: then each cataloged cdc file is decrypted in-process, re-encrypted into a backup
+> `cdc-volume`, verified, and referenced by `archive.json` plus the manifest; restore copies
+> it back and verifies the hash, so code checkpoints survive the drill. A compacted document
+> carries its stored oplog snapshot plus the frame tail, so restore
+> imports the snapshot and replays only newer frames; only a gap with no stored snapshot is
+> marked partial and skipped with a warning. The
+> in-repo security pass added regression tests for entry paths, backup/restore prefixes,
+> manifest keys, blob locators, presign tickets, and malicious code manifests. `workspace
+> backup --every SECS --keep N` is a foreground scheduled runner that applies retention to
+> complete backup prefixes and removes older/incomplete runs; `--keep` also works after a
+> one-shot backup. Retention also collects the encrypted backup archive when
+> `[backup.archive]` is configured: CDC locators from every retained run's catalog form the
+> live set, unreferenced files are deleted, and the remaining files are rewritten into a
+> fresh volume whose reference replaces `archive.json`. `workspace service generate`
+> writes systemd service/timer units or a launchd plist for one-shot scheduled backups,
+> using an absolute config path and the generator's working directory; CI validates the
+> files with `systemd-analyze verify` on Linux and `plutil -lint` on macOS. The transport
+> suite now kills a coordinator subprocess mid-chunked-snapshot and proves a relaunched
+> process reopens the same data directory and serves the snapshot from the beginning.
+> `workspace metrics` prints Prometheus text: oplog gauges,
+> per-storage blob gauges, persisted ingest and sweep counters, and release-stage latency
+> totals. Not built: the emthin offline outbox and catalog read replica, and the external
+> half of the security pass (`uw_*` audit and safestos grants).
 
 1. **Offline clients.** emthin keeps a local Loro doc plus an outbox of unacked local
    deltas; on reconnect it sends `Hello{version}` and replays. Catalog reads use a read-only
@@ -572,6 +693,7 @@ anything sensitive. Document this per-entry rather than implying blanket encrypt
 | graft | `just test` (`cargo nextest run`, doctests, `just run sqlite test`) | engine + VFS + new catalog SQL fixtures |
 | graft | `just build-all` | static/dynamic extension builds still work |
 | graft | new `workspace` integration test with `RemoteConfig::Fs` | ingest/commit/sweep/restore without network |
+| graft | `cargo test -p graft-workspace --test doc_examples` | guide transcripts replay; every example command and output is still on its page, and the pages agree on one captured run |
 | unfer | `cargo test -p unfer_ffi` | `uw_*` buffer protocol, handle table, negative paths |
 | unfer | `EXPECTED_SYMBOLS_WORKSPACE.txt` census + `symbol_sync` | ABI surface did not drift |
 | unfer | `bash workspace_module/run_demo.sh` | grant allow/deny, publish-approval flow |

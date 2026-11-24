@@ -69,9 +69,9 @@ async function findMarkdownFile(
   return files[0] || null;
 }
 
-/** Get all markdown files in a directory (non-recursive) */
+/** Get all markdown files in a directory, including subdirectories */
 async function getMarkdownFiles(dirPath: string): Promise<string[]> {
-  const files = await fg("*.{md,mdx}", { cwd: dirPath, absolute: true });
+  const files = await fg("**/*.{md,mdx}", { cwd: dirPath, absolute: true });
   return files.sort();
 }
 
@@ -96,11 +96,17 @@ async function collectPages(sourceDir: string): Promise<PageInfo[]> {
     const dirPath = path.join(sourceDir, directory);
     for (const filePath of await getMarkdownFiles(dirPath)) {
       const fm = await readFrontmatter(filePath);
-      const fileName = path.basename(filePath).replace(/\.(md|mdx)$/, "");
-      const slug = fileName === "index" ? directory : `${directory}/${fileName}`;
+      const segments = path
+        .relative(dirPath, filePath)
+        .replace(/\.(md|mdx)$/, "")
+        .split(path.sep);
+      if (segments.at(-1) === "index") {
+        segments.pop();
+      }
+      const slug = [directory, ...segments].join("/");
       pages.push({
         slug,
-        label: fm.title || fileName,
+        label: fm.title || segments.at(-1) || directory,
         description: fm.description,
       });
     }
